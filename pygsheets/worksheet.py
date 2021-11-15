@@ -154,6 +154,11 @@ class Worksheet(object):
                                                               'gridProperties/frozenColumnCount')
 
     @property
+    def merged_ranges(self):
+        """Ranges of merged cells in this sheet."""
+        return [GridRange(propertiesjson=x, worksheet=self) for x in self.jsonSheet.get('merges', list())]
+
+    @property
     def linked(self):
         """If the sheet is linked."""
         return self._linked
@@ -190,6 +195,7 @@ class Worksheet(object):
             :param  syncToCloud: update the cloud with local changes (data_grid), cached update calls if set to true
                           update the local copy with cloud if set to false
         """
+        warnings.warn('link and unlink is deprecated, use batch_mode instead.', category=DeprecationWarning)
         self._linked = True
         if syncToCloud:
             self.client.sheet.update_sheet_properties_request(self.spreadsheet.id, self.jsonSheet['properties'], '*')
@@ -214,6 +220,7 @@ class Worksheet(object):
              After unlinking, functions which return data won't work.
 
         """
+        warnings.warn('link and unlink is deprecated, use batch_mode instead.', category=DeprecationWarning)
         if save_grid:
             self._update_grid()
         self._linked = False
@@ -974,6 +981,44 @@ class Worksheet(object):
 
         self.client.sheet.batch_update(self.spreadsheet.id, request)
 
+    def apply_format(self, ranges, format_info, fields='userEnteredFormat'):
+        """
+        apply formatting for for multiple ranges
+
+        :param ranges: list of ranges (any type) to apply the formats to
+        :param format_info: list or single pygsheets cell or dict of properties specifying the formats to be updated,
+         see `this <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets/cells#CellFormat>`__
+         for available options. if a list is given it should match size of ranges.
+        :param fields: fields to be updated in the cell
+
+        Example:
+        >>> wks.apply_format('A1:A10', {"numberFormat": {"type": "NUMBER"}})
+        >>> wks.apply_format('A1:A10', "TEXT")  # by default number format is assumed
+        >>> wks.apply_format(ranges=['A1:B1', 'D:E'], format_info={'numberFormat': {"type": "NUMBER"}})
+        >>> mcell = Cell('A1')  # dummy cell
+        >>> mcell.format = (pygsheets.FormatType.PERCENT, '')
+        >>> wks.apply_format(ranges=['A1:B1', 'D:E'], format_info=mcell)
+
+        """
+        requests = []
+        format_info = [format_info] if not isinstance(format_info, list) else format_info
+        model_cells = [{"numberFormat": {"type": x.upper()}} if isinstance(x, str) else x for x in format_info]
+        ranges = [ranges] if not isinstance(ranges, list) else ranges
+        if len(model_cells) == 1:
+            model_cells = model_cells * len(ranges)
+        for crange, cell in zip(ranges, model_cells):
+            range_json = GridRange.create(crange, self).to_json()
+            if isinstance(cell, Cell):
+                cell = cell.get_json()
+            else:
+                cell = {"userEnteredFormat": cell}
+            requests.append({"repeatCell": {
+                "range": range_json,
+                "cell": cell,
+                "fields": fields or "userEnteredFormat,hyperlink,note,textFormatRuns,dataValidation,pivotTable"
+            }})
+        self.client.sheet.batch_update(self.spreadsheet.id, requests)
+
     @batchable
     def update_dimensions_visibility(self, start, end=None, dimension="ROWS", hidden=True):
         """Hide or show one or more rows or columns.
@@ -1194,7 +1239,7 @@ class Worksheet(object):
             return list(filter(lambda x: False if x.value.lower().find(pattern) == -1 else True, found_cells))
 
     @batchable
-    def create_named_range(self, name, start, end, grange, returnas='range'):
+    def create_named_range(self, name, start=None, end=None, grange=None, returnas='range'):
         """Create a new named range in this worksheet. Provide either start and end or grange.
 
         Reference: `Named range Api object <https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets#namedrange>`_
@@ -1215,11 +1260,14 @@ class Worksheet(object):
                 "name": name,
                 "range": grange.to_json()
             }}}
-        res = self.client.sheet.batch_update(self.spreadsheet.id, request)['replies'][0]['addNamedRange']['namedRange']
-        if returnas == 'json':
-            return res
-        else:
-            return DataRange(worksheet=self, namedjson=res)
+        res = self.client.sheet.batch_update(self.spreadsheet.id, request)
+
+        batch_mode = self.client.sheet.batch_mode
+        if not batch_mode:
+            if returnas == 'json':
+                return res['replies'][0]['addNamedRange']['namedRange']
+            else:
+                return DataRange(worksheet=self, namedjson=res)
 
     def get_named_range(self, name):
         """Get a named range by name.
@@ -1353,7 +1401,8 @@ class Worksheet(object):
         :param fit:             Resize the worksheet to fit all data inside if necessary.
         :param escape_formulae: Any value starting with an equal or plus sign (=/+), will be prefixed with an apostroph (') to
                                 avoid value being interpreted as a formula.
-        :param nan:             Value with which NaN values are replaced.
+        :param nan:             Value with which NaN values are replaced. by default it will be replaced with string 'nan'. for converting nan values to
+                                empty cells set nan="".
 
         """
 
@@ -1368,6 +1417,7 @@ class Worksheet(object):
         values = df.astype('unicode').values.tolist()
         (df_rows, df_cols) = df.shape
         num_indexes = 1
+        index_column_names = None
 
         if copy_index:
             if isinstance(df.index, pd.MultiIndex):
@@ -1377,25 +1427,37 @@ class Worksheet(object):
                     for index_item in reversed(list(indexes)):
                         values[i].insert(0, index_item)
                 df_cols += num_indexes
+                index_column_names = list(df.index.names) # creates the column names
             else:
                 for i, val in enumerate(df.index.astype(str)):
                     values[i].insert(0, val)
                 df_cols += num_indexes
+                index_column_names = [df.index.name] # creates the column name
 
         if copy_head:
-            # If multi index, copy indexes in each level to new row, colum/index names are not copied for now
+            # If multi index, copy indexes in each level to new row
             if isinstance(df.columns, pd.MultiIndex):
                 head = [""]*num_indexes if copy_index else []  # skip index columns
                 heads = [head[:] for x in df.columns[0]]
                 for col_head in df.columns:
                     for i, col_item in enumerate(col_head):
                         heads[i].append(str(col_item))
+                # adds in the index names to bottom header row if copy_index is also True
+                if copy_index:
+                    # to account for multi-index names we will replace all '' in our head list
+                    # with the index_column_names
+                    heads[-1][:num_indexes] = index_column_names
                 values = heads + values
                 df_rows += len(df.columns[0])
             else:
                 head = [""]*num_indexes if copy_index else []  # skip index columns
                 map(str, head)
                 head.extend(df.columns.tolist())
+                # if copy_index & copy_head, include the index names
+                if copy_index:
+                    # to account for multi-index names we will replace all '' in our head list
+                    # with the index_column_names
+                    head[:num_indexes] = index_column_names
                 values.insert(0, head)
                 df_rows += 1
 
@@ -1591,7 +1653,7 @@ class Worksheet(object):
         :return: list of :class:`Chart`
         """
         matched_charts = []
-        chart_data = self.client.sheet.get(self.spreadsheet.id,fields='sheets(charts,properties/sheetId)')
+        chart_data = self.client.sheet.get(self.spreadsheet.id, fields='sheets(charts,properties/sheetId)')
         sheet_list = chart_data.get('sheets')
         sheet = [x for x in sheet_list if x.get('properties', {}).get('sheetId') == self.id][0]
         chart_list = sheet.get('charts', [])
